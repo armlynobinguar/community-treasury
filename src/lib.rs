@@ -207,7 +207,7 @@ impl CommunityTreasuryContract {
         if env.storage().instance().has(&INITIALIZED) {
             panic!("already initialized");
         }
-        assert!(quorum_bps > 0 && quorum_bps <= 10_000, "quorum_bps must be 1–10000");
+        assert!(quorum_bps > 0 && quorum_bps <= 10_000, "quorum_bps must be 1-10000");
         assert!(voting_window > 0, "voting window must be positive");
         assert!(veto_period > 0, "veto period must be positive");
         assert!(spending_cap >= 0, "spending cap cannot be negative");
@@ -254,7 +254,7 @@ impl CommunityTreasuryContract {
         admin.require_auth();
         let mut config = Self::load_config(&env);
         assert!(config.admin == admin, "caller is not the admin");
-        assert!(quorum_bps > 0 && quorum_bps <= 10_000, "quorum_bps must be 1–10000");
+        assert!(quorum_bps > 0 && quorum_bps <= 10_000, "quorum_bps must be 1-10000");
         assert!(voting_window > 0, "voting window must be positive");
         assert!(veto_period > 0, "veto period must be positive");
         assert!(spending_cap >= 0, "spending cap cannot be negative");

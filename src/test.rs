@@ -178,13 +178,13 @@ fn test_double_initialize_panics() {
 }
 
 #[test]
-#[should_panic(expected = "quorum_bps must be 1–10000")]
+#[should_panic(expected = "quorum_bps must be 1-10000")]
 fn test_initialize_zero_quorum_panics() {
     setup_params(0, VOTE_WINDOW, VETO_PERIOD, 0);
 }
 
 #[test]
-#[should_panic(expected = "quorum_bps must be 1–10000")]
+#[should_panic(expected = "quorum_bps must be 1-10000")]
 fn test_initialize_quorum_above_10000_panics() {
     setup_params(10_001, VOTE_WINDOW, VETO_PERIOD, 0);
 }
@@ -634,8 +634,7 @@ fn test_execute_transfers_funds_to_recipient() {
     let ctx = setup();
     let voter = Address::generate(&ctx.env);
     mint_gov(&ctx, &voter, 10_000);
-    let voters = vec![(voter, 10_000_i128)];
-    let (_, proposer) = full_pass(&ctx, 500, &voters);
+    let (_, proposer) = full_pass(&ctx, 500, &[(voter, 10_000_i128)]);
 
     assert_eq!(bal_treasury(&ctx, &proposer), 500);
 }
@@ -876,10 +875,21 @@ fn test_two_queued_proposals_both_reserved() {
 fn test_cannot_over_commit_treasury_with_proposals() {
     let ctx = setup();
     fund(&ctx, 1_000);
-    propose(&ctx, 1_000); // reserves will use all 1_000
+    let (_, id1) = propose(&ctx, 1_000);
 
-    // Second proposal for 1 — treasury = 1_000, already committed 1_000
-    // so available = 0
+    // Vote to pass proposal 1.
+    let voter = Address::generate(&ctx.env);
+    mint_gov(&ctx, &voter, 10_000);
+    ctx.client.vote(&voter, &id1, &VoteDirection::For);
+
+    // Queue proposal 1 so amount becomes reserved.
+    set_time(&ctx.env, T0 + VOTE_WINDOW + 1);
+    ctx.client.queue_proposal(&id1);
+    assert_eq!(ctx.client.get_reserved_balance(), 1_000);
+    assert_eq!(ctx.client.get_available_balance(), 0);
+
+    // Now even a 1-token proposal should fail.
+    set_time(&ctx.env, T0 + VOTE_WINDOW + 2);
     let proposer2 = Address::generate(&ctx.env);
     mint_gov(&ctx, &proposer2, 100);
     let result = ctx.client.try_submit_proposal(
