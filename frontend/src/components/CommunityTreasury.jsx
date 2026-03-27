@@ -1,7 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   SorobanRpc,
+  rpc,
   TransactionBuilder,
+  Account,
+  Keypair,
   Networks,
   BASE_FEE,
   Contract,
@@ -10,55 +13,102 @@ import {
   Address,
   xdr,
 } from "@stellar/stellar-sdk";
-import { isConnected, getAddress, signTransaction } from "@stellar/freighter-api";
+import { isConnected, requestAccess, getAddress, signTransaction } from "@stellar/freighter-api";
 
 const CONTRACT_ID = import.meta.env.VITE_CONTRACT_ID ?? "YOUR_CONTRACT_ID";
 const RPC_URL = import.meta.env.VITE_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const NETWORK_PASS = import.meta.env.VITE_NETWORK_PASSPHRASE ?? Networks.TESTNET;
 const TREASURY_TKN = import.meta.env.VITE_TREASURY_TOKEN_ID ?? "TREASURY_TOKEN_ID";
+const HAS_CONTRACT_ID = CONTRACT_ID !== "YOUR_CONTRACT_ID";
+const RPC = SorobanRpc ?? rpc;
 
-const server = new SorobanRpc.Server(RPC_URL);
-const contract = new Contract(CONTRACT_ID);
+const server = RPC ? new RPC.Server(RPC_URL) : null;
+const contract = HAS_CONTRACT_ID ? new Contract(CONTRACT_ID) : null;
+
+async function getTransactionStatusRaw(hash) {
+  const res = await fetch(RPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getTransaction",
+      params: { hash },
+    }),
+  });
+  const payload = await res.json();
+  if (payload.error) {
+    throw new Error(payload.error.message ?? "RPC getTransaction failed");
+  }
+  return payload.result;
+}
 
 async function simulateAndSend(sourcePublicKey, operation) {
-  const account = await server.getAccount(sourcePublicKey);
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASS,
-  })
-    .addOperation(operation)
-    .setTimeout(30)
-    .build();
-
-  const simResult = await server.simulateTransaction(tx);
-  if (SorobanRpc.Api.isSimulationError(simResult)) {
-    throw new Error(simResult.error);
+  if (!server || !RPC) {
+    throw new Error("Stellar SDK RPC API is unavailable. Check @stellar/stellar-sdk version.");
   }
+  let step = "load account";
+  try {
+    const account = await server.getAccount(sourcePublicKey);
+    step = "build tx";
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASS,
+    })
+      .addOperation(operation)
+      .setTimeout(30)
+      .build();
 
-  const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
-  const signedXdr = await signTransaction(preparedTx.toXDR(), {
-    networkPassphrase: NETWORK_PASS,
-  });
+    step = "prepare tx";
+    const preparedTx = await server.prepareTransaction(tx);
+    step = "freighter sign";
+    const signed = await signTransaction(preparedTx.toXDR(), {
+      networkPassphrase: NETWORK_PASS,
+      address: sourcePublicKey,
+    });
+    if (signed?.error) {
+      throw new Error(signed.error);
+    }
 
-  const signedTx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASS);
-  const response = await server.sendTransaction(signedTx);
-  if (response.status === "ERROR") throw new Error(response.errorResult?.toString());
+    // Freighter may return a raw XDR string or an object containing signedTxXdr.
+    const signedXdr = typeof signed === "string" ? signed : signed?.signedTxXdr ?? signed?.signedTxXDR;
+    if (!signedXdr || typeof signedXdr !== "string") {
+      throw new Error("Freighter returned an invalid signed transaction payload.");
+    }
 
-  let getResponse = await server.getTransaction(response.hash);
-  while (getResponse.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
-    await new Promise((r) => setTimeout(r, 1000));
-    getResponse = await server.getTransaction(response.hash);
+    step = "parse signed XDR";
+    const signedTx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASS);
+    step = "send tx";
+    const response = await server.sendTransaction(signedTx);
+    if (response.status === "ERROR") throw new Error(response.errorResult?.toString());
+
+    step = "poll tx";
+    let getResponse = await getTransactionStatusRaw(response.hash);
+    while (getResponse?.status === "NOT_FOUND") {
+      await new Promise((r) => setTimeout(r, 1000));
+      getResponse = await getTransactionStatusRaw(response.hash);
+    }
+    if (getResponse?.status === "FAILED") {
+      throw new Error("Transaction failed");
+    }
+    if (getResponse?.status !== "SUCCESS") {
+      throw new Error(`Unexpected transaction status: ${getResponse?.status ?? "unknown"}`);
+    }
+    return getResponse;
+  } catch (e) {
+    throw new Error(`Transaction ${step} failed: ${e?.message ?? e}`);
   }
-  if (getResponse.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-    throw new Error("Transaction failed");
-  }
-  return getResponse;
 }
 
 async function readOnly(method, args = []) {
-  const account = await server.getAccount(
-    "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
-  );
+  if (!server || !RPC) {
+    throw new Error("Stellar SDK RPC API is unavailable. Check @stellar/stellar-sdk version.");
+  }
+  if (!contract) {
+    throw new Error("Missing VITE_CONTRACT_ID. Set it in your frontend .env file.");
+  }
+  // Simulations only need a valid account shape, not an on-chain funded account.
+  const account = new Account(Keypair.random().publicKey(), "0");
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
     networkPassphrase: NETWORK_PASS,
@@ -68,8 +118,38 @@ async function readOnly(method, args = []) {
     .build();
 
   const sim = await server.simulateTransaction(tx);
-  if (SorobanRpc.Api.isSimulationError(sim)) throw new Error(sim.error);
-  return scValToNative(sim.result.retval);
+  if (RPC.Api.isSimulationError(sim)) throw new Error(sim.error);
+  return scValToNative(extractSimRetval(sim));
+}
+
+function extractSimRetval(sim) {
+  // Older SDK shape: sim.result.retval is already an ScVal.
+  if (sim?.result?.retval) return sim.result.retval;
+
+  // Newer SDK shape: sim.result.results[0].xdr (base64 ScVal XDR).
+  const xdrB64 = sim?.result?.results?.[0]?.xdr ?? sim?.results?.[0]?.xdr;
+  if (xdrB64) return xdr.ScVal.fromXDR(xdrB64, "base64");
+
+  throw new Error("Simulation response missing return value.");
+}
+
+async function readTokenBalance(tokenContractId, holderAddress) {
+  if (!server || !RPC) {
+    throw new Error("Stellar SDK RPC API is unavailable. Check @stellar/stellar-sdk version.");
+  }
+  const account = new Account(Keypair.random().publicKey(), "0");
+  const tokenContract = new Contract(tokenContractId);
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASS,
+  })
+    .addOperation(tokenContract.call("balance", Address.fromString(holderAddress).toScVal()))
+    .setTimeout(30)
+    .build();
+
+  const sim = await server.simulateTransaction(tx);
+  if (RPC.Api.isSimulationError(sim)) throw new Error(sim.error);
+  return BigInt(scValToNative(extractSimRetval(sim)));
 }
 
 function stroops(amount) {
@@ -527,6 +607,7 @@ export default function CommunityTreasury() {
   const [availableBal, setAvailableBal] = useState(0n);
   const [proposals, setProposals] = useState([]);
   const [dataLoading, setDataLoading] = useState(false);
+  const [needsInitialization, setNeedsInitialization] = useState(false);
 
   const [toast, setToast] = useState({ msg: "", type: "info" });
   const notify = (msg, type = "info") => {
@@ -546,14 +627,29 @@ export default function CommunityTreasury() {
   const connectWallet = async () => {
     setWalletLoading(true);
     try {
-      const connected = await isConnected();
+      const connectedResult = await isConnected();
+      const connected =
+        typeof connectedResult === "boolean" ? connectedResult : Boolean(connectedResult?.isConnected);
       if (!connected) {
         notify("Freighter not found. Install at freighter.app", "error");
         return;
       }
+
+      // Requesting access is what prompts the Freighter popup.
+      const access = await requestAccess();
+      if (access?.error) throw new Error(access.error);
+
+      if (access?.address) {
+        setWalletAddress(access.address);
+        notify("Wallet connected", "success");
+        return;
+      }
+
       const result = await getAddress();
-      if (result.error) throw new Error(result.error);
-      setWalletAddress(result.address);
+      if (result?.error) throw new Error(result.error);
+      const address = typeof result === "string" ? result : result?.address;
+      if (!address) throw new Error("Freighter did not return a wallet address.");
+      setWalletAddress(address);
       notify("Wallet connected", "success");
     } catch (e) {
       notify(e.message, "error");
@@ -568,6 +664,15 @@ export default function CommunityTreasury() {
   };
 
   const loadData = useCallback(async () => {
+    if (!HAS_CONTRACT_ID) {
+      setConfig(null);
+      setTreasuryBal(0n);
+      setReservedBal(0n);
+      setAvailableBal(0n);
+      setProposals([]);
+      setNeedsInitialization(false);
+      return;
+    }
     setDataLoading(true);
     try {
       const [cfg, tBal, rBal, aBal, allIds] = await Promise.all([
@@ -595,8 +700,23 @@ export default function CommunityTreasury() {
       } else {
         setProposals([]);
       }
+      setNeedsInitialization(false);
     } catch (e) {
-      notify(`Failed to load data: ${e.message}`, "error");
+      const message = String(e?.message ?? e ?? "");
+      const hitUninitializedConfig =
+        message.includes("get_config") &&
+        (message.includes("InvalidAction") || message.includes("UnreachableCodeReached"));
+      if (hitUninitializedConfig) {
+        setNeedsInitialization(true);
+        setConfig(null);
+        setTreasuryBal(0n);
+        setReservedBal(0n);
+        setAvailableBal(0n);
+        setProposals([]);
+        notify("Contract is deployed but not initialized yet. Initialize it first, then refresh.", "error");
+      } else {
+        notify(`Failed to load data: ${message}`, "error");
+      }
     } finally {
       setDataLoading(false);
     }
@@ -607,25 +727,21 @@ export default function CommunityTreasury() {
   }, [loadData]);
 
   const handleDeposit = async () => {
+    if (!HAS_CONTRACT_ID) return notify("Missing VITE_CONTRACT_ID in frontend .env", "error");
     if (!walletAddress) return notify("Connect wallet first", "error");
     if (!depositAmt || parseFloat(depositAmt) <= 0) return notify("Enter a valid amount", "error");
     setLoadingId("deposit");
     try {
       const amount = stroops(depositAmt);
-      const sacContract = new Contract(TREASURY_TKN);
-      const approveOp = sacContract.call(
-        "approve",
-        new Address(walletAddress).toScVal(),
-        new Address(CONTRACT_ID).toScVal(),
-        nativeToScVal(amount, { type: "i128" }),
-        nativeToScVal(500, { type: "u32" })
-      );
-      await simulateAndSend(walletAddress, approveOp);
+      const treasuryTokenId = String(config?.treasury_token ?? "").trim() || TREASURY_TKN;
+      if (!treasuryTokenId || treasuryTokenId === "TREASURY_TOKEN_ID") {
+        return notify("Treasury token not configured yet. Set VITE_TREASURY_TOKEN_ID or initialize contract config.", "error");
+      }
 
       const depositOp = contract.call(
         "deposit",
-        new Address(walletAddress).toScVal(),
-        nativeToScVal(amount, { type: "i128" })
+        Address.fromString(walletAddress).toScVal(),
+        nativeToScVal(amount.toString(), { type: "i128" })
       );
       await simulateAndSend(walletAddress, depositOp);
 
@@ -641,17 +757,40 @@ export default function CommunityTreasury() {
   };
 
   const handleSubmitProposal = async () => {
+    if (!HAS_CONTRACT_ID) return notify("Missing VITE_CONTRACT_ID in frontend .env", "error");
     if (!walletAddress) return notify("Connect wallet first", "error");
     if (!propTitle || !propDesc || !propRecipient || !propAmount) return notify("Fill all fields", "error");
+    const parsedAmount = parseFloat(propAmount);
+    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+      return notify("Proposal amount must be greater than 0", "error");
+    }
     setLoadingId("submit");
     try {
+      const amountStroops = stroops(parsedAmount);
+
+      if (amountStroops > availableBal) {
+        return notify("Insufficient available treasury funds", "error");
+      }
+      if (config?.spending_cap > 0 && amountStroops > BigInt(config.spending_cap)) {
+        return notify("Amount exceeds spending cap", "error");
+      }
+
+      const govTokenId = String(config?.governance_token ?? "").trim();
+      if (!govTokenId) {
+        return notify("Governance token not configured on contract", "error");
+      }
+      const govBal = await readTokenBalance(govTokenId, walletAddress);
+      if (govBal <= 0n) {
+        return notify("Proposer must hold governance tokens", "error");
+      }
+
       const op = contract.call(
         "submit_proposal",
-        new Address(walletAddress).toScVal(),
+        Address.fromString(walletAddress).toScVal(),
         nativeToScVal(propTitle, { type: "string" }),
         nativeToScVal(propDesc, { type: "string" }),
-        new Address(propRecipient).toScVal(),
-        nativeToScVal(stroops(propAmount), { type: "i128" })
+        Address.fromString(propRecipient).toScVal(),
+        nativeToScVal(amountStroops.toString(), { type: "i128" })
       );
       await simulateAndSend(walletAddress, op);
       notify("Proposal submitted", "success");
@@ -669,14 +808,16 @@ export default function CommunityTreasury() {
   };
 
   const handleVote = async (proposalId, direction) => {
+    if (!HAS_CONTRACT_ID) return notify("Missing VITE_CONTRACT_ID in frontend .env", "error");
     if (!walletAddress) return notify("Connect wallet first", "error");
     const key = `${proposalId}-vote-${direction.toLowerCase()}`;
     setLoadingId(key);
     try {
-      const dirScVal = xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(direction)]);
+      // VoteDirection enum is encoded as vec[symbol] for Soroban.
+      const dirScVal = nativeToScVal([direction], { type: "vec" });
       const op = contract.call(
         "vote",
-        new Address(walletAddress).toScVal(),
+        Address.fromString(walletAddress).toScVal(),
         nativeToScVal(proposalId, { type: "u64" }),
         dirScVal
       );
@@ -691,6 +832,7 @@ export default function CommunityTreasury() {
   };
 
   const handleQueue = async (proposalId) => {
+    if (!HAS_CONTRACT_ID) return notify("Missing VITE_CONTRACT_ID in frontend .env", "error");
     if (!walletAddress) return notify("Connect wallet first", "error");
     setLoadingId(`${proposalId}-queue`);
     try {
@@ -706,6 +848,7 @@ export default function CommunityTreasury() {
   };
 
   const handleExecute = async (proposalId) => {
+    if (!HAS_CONTRACT_ID) return notify("Missing VITE_CONTRACT_ID in frontend .env", "error");
     if (!walletAddress) return notify("Connect wallet first", "error");
     setLoadingId(`${proposalId}-execute`);
     try {
@@ -721,12 +864,13 @@ export default function CommunityTreasury() {
   };
 
   const handleCancel = async (proposalId) => {
+    if (!HAS_CONTRACT_ID) return notify("Missing VITE_CONTRACT_ID in frontend .env", "error");
     if (!walletAddress) return notify("Connect wallet first", "error");
     setLoadingId(`${proposalId}-cancel`);
     try {
       const op = contract.call(
         "cancel_proposal",
-        new Address(walletAddress).toScVal(),
+        Address.fromString(walletAddress).toScVal(),
         nativeToScVal(proposalId, { type: "u64" })
       );
       await simulateAndSend(walletAddress, op);
@@ -862,6 +1006,22 @@ export default function CommunityTreasury() {
       </header>
 
       <main style={{ maxWidth: 1080, margin: "0 auto", padding: "32px 24px", position: "relative", zIndex: 1 }}>
+        {!HAS_CONTRACT_ID && (
+          <Card style={{ marginBottom: 20, border: "1px solid rgba(248,113,113,.35)", background: "rgba(248,113,113,.08)" }}>
+            <div style={{ color: "#fca5a5", fontFamily: "'Space Mono', monospace", fontSize: 12, lineHeight: 1.6 }}>
+              Missing `VITE_CONTRACT_ID`. Create `frontend/.env` and set your Soroban IDs, then restart `npm run dev`.
+            </div>
+          </Card>
+        )}
+        {needsInitialization && (
+          <Card style={{ marginBottom: 20, border: "1px solid rgba(248,113,113,.35)", background: "rgba(248,113,113,.08)" }}>
+            <div style={{ color: "#fca5a5", fontFamily: "'Space Mono', monospace", fontSize: 12, lineHeight: 1.6 }}>
+              Contract is not initialized yet. Run your initialize call with admin + treasury token + governance token, then click
+              Refresh.
+            </div>
+          </Card>
+        )}
+
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 16, marginBottom: 32 }}>
           <StatCard
             label="Treasury Balance"
@@ -906,7 +1066,6 @@ export default function CommunityTreasury() {
               style={{
                 padding: "9px 20px",
                 borderRadius: 10,
-                border: "none",
                 cursor: "pointer",
                 fontFamily: "'Space Mono', monospace",
                 fontSize: 12,
@@ -934,7 +1093,6 @@ export default function CommunityTreasury() {
                   style={{
                     padding: "5px 14px",
                     borderRadius: 99,
-                    border: "none",
                     cursor: "pointer",
                     fontFamily: "'Space Mono', monospace",
                     fontSize: 11,
@@ -1021,7 +1179,7 @@ export default function CommunityTreasury() {
                   <div style={{ fontSize: 18, color: "#22d3ee", fontFamily: "'DM Mono', monospace", fontWeight: 700 }}>
                     {depositAmt ? parseFloat(depositAmt).toFixed(4) : "0.0000"} tokens
                   </div>
-                  <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>Contract will first request approve() then deposit()</div>
+                  <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>Contract will transfer tokens during deposit()</div>
                 </div>
 
                 <Btn
