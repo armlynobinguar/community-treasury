@@ -1,4 +1,4 @@
-# community-treasury
+# soroban-community-treasury
 
 A DAO community treasury built on [Stellar's Soroban](https://soroban.stellar.org) platform. Members deposit tokens into a shared pool, propose spending requests, and vote with token-weighted governance. Passed proposals enter a veto window before funds are released. Designed as the on-chain treasury and governance primitive for DAOs, community funds, and protocol treasuries on Stellar.
 
